@@ -19,6 +19,7 @@
  * limitations under the License.
  */
 
+#include <chrono>
 #include "ros2_api.h"
 #include "ldlidar_driver.h"
 
@@ -52,6 +53,12 @@ int main(int argc, char **argv) {
   node->declare_parameter<bool>("enable_angle_crop_func", setting.enable_angle_crop_func);
   node->declare_parameter<double>("angle_crop_min", setting.angle_crop_min);
   node->declare_parameter<double>("angle_crop_max", setting.angle_crop_max);
+  // Seconds without scan data before the node exits (0 = never). A lidar
+  // that stops sending (a brown-out, or USB dropping and coming back as
+  // another ttyUSB) is never read again on the old port; exiting lets the
+  // launch file's respawn open it afresh by its /dev/serial/by-id name.
+  double no_data_exit_s = 5.0;
+  node->declare_parameter<double>("no_data_exit_s", no_data_exit_s);
 
   // get ros2 param
   node->get_parameter("product_name", product_name);
@@ -63,6 +70,7 @@ int main(int argc, char **argv) {
   node->get_parameter("enable_angle_crop_func", setting.enable_angle_crop_func);
   node->get_parameter("angle_crop_min", setting.angle_crop_min);
   node->get_parameter("angle_crop_max", setting.angle_crop_max);
+  node->get_parameter("no_data_exit_s", no_data_exit_s);
 
   ldlidar::LDLidarDriver* ldlidarnode = new ldlidar::LDLidarDriver();
 
@@ -115,9 +123,12 @@ int main(int argc, char **argv) {
   ldlidar::Points2D laser_scan_points;
   double lidar_scan_freq;
   RCLCPP_INFO(node->get_logger(), "Publish topic message:ldlidar scan data.");
+  int exit_code = 0;
+  auto last_data = std::chrono::steady_clock::now();
   while (rclcpp::ok()) {
     switch (ldlidarnode->GetLaserScanData(laser_scan_points, 1500)){
       case ldlidar::LidarStatus::NORMAL: 
+        last_data = std::chrono::steady_clock::now();
         ldlidarnode->GetLidarScanFreq(lidar_scan_freq);
         ToLaserscanMessagePublish(laser_scan_points, lidar_scan_freq, setting, node, publisher);
         break;
@@ -128,6 +139,15 @@ int main(int argc, char **argv) {
         break;
       default:
         break;
+    }
+
+    const double silent_s = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_data).count();
+    if (no_data_exit_s > 0.0 && silent_s > no_data_exit_s) {
+      RCLCPP_FATAL(node->get_logger(),
+        "no lidar data for %.1f s: exiting so the driver is restarted on a fresh port", silent_s);
+      exit_code = EXIT_FAILURE;
+      break;
     }
 
     r.sleep();
@@ -141,7 +161,7 @@ int main(int argc, char **argv) {
   RCLCPP_INFO(node->get_logger(), "ldlidar_published is end");
   rclcpp::shutdown();
 
-  return 0;
+  return exit_code;
 }
 
 void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq, LaserScanSetting& setting,
